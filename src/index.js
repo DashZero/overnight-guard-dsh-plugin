@@ -24,11 +24,7 @@ export function apply(ctx, config = {}) {
     if (guards.has(sessionId)) return
     if (config.sessionId && config.sessionId !== sessionId) return
 
-    const cwd = agent.session.header?.cwd
-    if (!cwd) {
-      logger.info(`session ${sessionId} has no cwd; not guarded`)
-      return
-    }
+    const cwd = agent.session.header?.cwd || ctx.get('workingDirectory')?.defaultDirectory || process.cwd()
 
     // Guard every session by default; guard.config.json in the session's cwd
     // overrides the defaults. Create a STOP file in the cwd to halt.
