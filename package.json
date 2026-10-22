@@ -1,8 +1,9 @@
 {
-  "name": "@local/dsh-overnight-guard",
+  "name": "dsh-overnight-guard",
   "version": "1.0.0",
-  "private": true,
+  "description": "Overnight guard plugin for DeepSeek Harness — auto-recovers stream stalls and provider failures so unattended jobs survive the night.",
   "type": "module",
+  "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./locale/*.json": "./locale/*.json",
@@ -19,6 +20,17 @@
       "patch": "./cordis.patch.yml"
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DashZero/overnight-guard-dsh-plugin.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "overnight-guard"
+  ],
+  "license": "MIT",
   "scripts": {
     "test": "node --test test/*.test.js"
   }

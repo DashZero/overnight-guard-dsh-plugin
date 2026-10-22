@@ -1,5 +1,5 @@
 - insert:
     - id: overnight-guard
-      name: '@local/dsh-overnight-guard'
+      name: 'dsh-overnight-guard'
       config:
         configFile: guard.config.json
