@@ -7,9 +7,10 @@ import { tmpdir } from 'node:os'
 import { OvernightGuard } from '../src/guard.js'
 import { validateConfig, resolvePaths } from '../src/config.js'
 
-// Fake timers that don't keep the process alive
+// Fake timers that don't keep the process alive. setTimeout fires
+// immediately so async sleeps resolve without real waiting.
 const fakeTimers = {
-  setTimeout: (cb, ms) => ({ unref: () => {}, callback: cb, ms }),
+  setTimeout: (cb, ms) => { cb(); return { unref: () => {} } },
   clearTimeout: () => {},
   setInterval: (cb, ms) => ({ unref: () => {}, callback: cb, ms }),
   clearInterval: () => {},
@@ -81,7 +82,7 @@ describe('manual test simulation', () => {
     cleanup(dir)
   })
 
-  test('simulated provider error with backoff', () => {
+  test('simulated provider error with backoff', async () => {
     const dir = tempDir()
     const config = validateConfig({
       stallSeconds: 1,
@@ -120,21 +121,23 @@ describe('manual test simulation', () => {
       failure: { message: '503 Service Unavailable', code: 'service_unavailable' },
     }
 
-    const result1 = guard.onRequestError(payload, () => {})
+    const result1 = await guard.onRequestError(payload, () => {})
     assert.strictEqual(result1.kind, 'retry')
     assert.strictEqual(guard.errorBackoff.retryCount, 1)
 
-    const result2 = guard.onRequestError(payload, () => {})
+    const result2 = await guard.onRequestError(payload, () => {})
     assert.strictEqual(result2.kind, 'retry')
     assert.strictEqual(guard.errorBackoff.retryCount, 2)
 
-    const result3 = guard.onRequestError(payload, () => {})
+    const result3 = await guard.onRequestError(payload, () => {})
     assert.strictEqual(result3.kind, 'retry')
     assert.strictEqual(guard.errorBackoff.retryCount, 3)
 
     // Max retries reached
-    const result4 = guard.onRequestError(payload, () => {})
+    let nextCalled = false
+    const result4 = await guard.onRequestError(payload, () => { nextCalled = true })
     assert.strictEqual(result4, undefined) // next() was called
+    assert.ok(nextCalled)
     assert.strictEqual(guard.state, 'blocked')
 
     guard.stop()

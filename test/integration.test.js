@@ -4,7 +4,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from 'node
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import { OvernightGuard } from '../src/guard.js'
+import { OvernightGuard, parseResetAfter } from '../src/guard.js'
 import { validateConfig, resolvePaths } from '../src/config.js'
 
 // Fake clock for deterministic tests
@@ -279,5 +279,110 @@ describe('OvernightGuard integration', () => {
     assert.ok(!content.includes('sk-secret123'))
     assert.ok(!content.includes('Bearer token'))
     assert.ok(content.includes('[REDACTED]'))
+  })
+
+  test('turn error nudges the session to continue', () => {
+    guard.start()
+    guard.onTurnStart({ turn: 1 })
+
+    // "The upstream service could not complete this stream."
+    guard.onTurnEnd({
+      turn: 1,
+      reason: {
+        kind: 'error',
+        error: { message: 'The upstream service could not complete this stream.', code: 'api_error' },
+      },
+    })
+
+    const lastMessage = agent.messages[agent.messages.length - 1]
+    assert.ok(lastMessage, 'a continue message was sent')
+    assert.ok(lastMessage.content[0].text.includes('Continue with the current task'))
+    assert.strictEqual(guard.consecutiveTurnErrors, 1)
+    assert.ok(!guard.halted)
+
+    const log = readFileSync(paths.logFile, 'utf8')
+    assert.ok(log.includes('turn_error'))
+    assert.ok(log.includes('turn_error_nudge_sent'))
+  })
+
+  test('turn error with "reset after 8m 49s" waits for quota reset', () => {
+    const scheduled = []
+    const fakeSetTimeout = (cb, ms) => { scheduled.push({ cb, ms }); return { cb } }
+    const g = new OvernightGuard({
+      config, paths, agent,
+      ctx: { on: (e, l) => eventSource.on(e, l), logger: () => ({ info: () => {}, error: () => {} }) },
+      onHalt: () => {},
+      setTimeout: fakeSetTimeout,
+    })
+    g.start()
+    g.onTurnStart({ turn: 1 })
+
+    g.onTurnEnd({
+      turn: 1,
+      reason: {
+        kind: 'error',
+        error: { message: '503: {"message":"[codex/gpt-6.1-sol] [400]"} (reset after 8m 49s)', code: 'UNKNOWN' },
+      },
+    })
+
+    // No message sent yet — waiting for the quota reset
+    assert.strictEqual(agent.messages.length, 0)
+    const quotaWait = scheduled.find(t => t.ms === (8 * 60 + 49) * 1000 + 1000)
+    assert.ok(quotaWait, 'a timer was set for reset time + 1s buffer')
+
+    // Fire the timer — now the continue message is sent
+    quotaWait.cb()
+    const lastMessage = agent.messages[agent.messages.length - 1]
+    assert.ok(lastMessage.content[0].text.includes('Continue with the current task'))
+
+    g.stop()
+  })
+
+  test('halts after too many consecutive turn errors', () => {
+    guard.start()
+
+    for (let i = 1; i <= config.maxErrorRetries + 1; i++) {
+      guard.onTurnStart({ turn: i })
+      guard.onTurnEnd({
+        turn: i,
+        reason: { kind: 'error', error: { message: 'Connection error.', code: 'UNKNOWN' } },
+      })
+    }
+
+    assert.ok(guard.halted)
+    assert.strictEqual(guard.haltReason, 'too_many_consecutive_turn_errors')
+  })
+
+  test('completed turn resets consecutive turn error counter', () => {
+    guard.start()
+
+    guard.onTurnStart({ turn: 1 })
+    guard.onTurnEnd({ turn: 1, reason: { kind: 'error', error: { message: 'x', code: 'UNKNOWN' } } })
+    assert.strictEqual(guard.consecutiveTurnErrors, 1)
+
+    guard.onTurnStart({ turn: 2 })
+    guard.onTurnEnd({ turn: 2, reason: { kind: 'completed' } })
+    assert.strictEqual(guard.consecutiveTurnErrors, 0)
+    assert.ok(!guard.halted)
+  })
+})
+
+describe('parseResetAfter', () => {
+  test('parses minutes and seconds', () => {
+    assert.strictEqual(parseResetAfter('503: {} (reset after 8m 49s)'), (8 * 60 + 49) * 1000)
+  })
+
+  test('parses seconds only', () => {
+    assert.strictEqual(parseResetAfter('reset after 45s'), 45000)
+  })
+
+  test('parses hours, minutes, seconds', () => {
+    assert.strictEqual(parseResetAfter('reset after 1h 2m 3s'), (3600 + 120 + 3) * 1000)
+  })
+
+  test('returns null without a reset hint', () => {
+    assert.strictEqual(parseResetAfter('Connection error.'), null)
+    assert.strictEqual(parseResetAfter(undefined), null)
+    assert.strictEqual(parseResetAfter(''), null)
   })
 })

@@ -1,84 +1,90 @@
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { loadConfig, resolvePaths } from './config.js'
+import { validateConfig, resolvePaths } from './config.js'
 import { OvernightGuard } from './guard.js'
 
 /**
- * DSH Overnight Guard plugin.
+ * dsh-overnight-guard — watches a session, recovers stalls/errors, enforces caps.
  *
- * Observes a session for stalls, loops, and provider errors.
- * Recovers automatically and enforces caps.
+ * Plugin config (the Loader entry row's `config`):
+ * - `configFile` (string, default "guard.config.json"): name of the guard
+ *   config file, resolved against each session's working directory. A session
+ *   is guarded only when this file exists in its cwd.
+ * - `sessionId` (string, optional): guard only this session id.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {object} config
+ * @param {{ configFile?: string, sessionId?: string }} [config]
  */
-export function apply(ctx, config) {
+export function apply(ctx, config = {}) {
   const logger = ctx.logger('overnight-guard')
-
-  // Validate config
-  let validatedConfig
-  try {
-    validatedConfig = loadConfig(config.configFile || 'guard.config.json')
-  } catch (error) {
-    logger.error('Failed to load config:', error.message)
-    throw error
-  }
-
-  const workingDir = config.workingDir || process.cwd()
-  const paths = resolvePaths(validatedConfig, workingDir)
-
-  logger.info('Overnight guard plugin loaded')
-  logger.info('Working directory:', workingDir)
-  logger.info('Log file:', paths.logFile)
-  logger.info('Status file:', paths.statusFile)
-
-  // Track active guards by session id
   const guards = new Map()
 
-  // Listen for agent creation
-  const disposeAgentCreated = ctx.on('agent/created', (agent) => {
+  function armGuard(agent) {
     const sessionId = agent.session.id
-    logger.info('Agent created for session:', sessionId)
+    if (guards.has(sessionId)) return
+    if (config.sessionId && config.sessionId !== sessionId) return
 
+    const cwd = agent.session.header?.cwd ?? process.cwd()
+    const configFile = resolve(cwd, config.configFile ?? 'guard.config.json')
+    if (!existsSync(configFile)) {
+      logger.info(`no guard config at ${configFile}; session ${sessionId} is not guarded`)
+      return
+    }
+
+    let guardConfig
+    try {
+      guardConfig = validateConfig(JSON.parse(readFileSync(configFile, 'utf8')), configFile)
+    } catch (error) {
+      logger.error(`invalid guard config ${configFile}: ${error.message}`)
+      return
+    }
+
+    const paths = resolvePaths(guardConfig, cwd)
     const guard = new OvernightGuard({
-      config: validatedConfig,
+      config: guardConfig,
       paths,
       agent,
       ctx,
       onHalt: (reason) => {
-        logger.info('Guard halted for session', sessionId, ':', reason)
-        guards.delete(sessionId)
+        logger.info(`guard halted for session ${sessionId}: ${reason}`)
       },
     })
-
     guards.set(sessionId, guard)
     guard.start()
+    logger.info(`guarding session ${sessionId} (cwd: ${cwd})`)
+  }
 
-    // Clean up when agent is disposed
-    ctx.on('agent/disposed', (disposedAgent) => {
-      if (disposedAgent === agent) {
-        guard.stop()
-        guards.delete(sessionId)
-        logger.info('Guard stopped for session:', sessionId)
-      }
-    })
+  // Arm on every agent created after this plugin loads. Payload shape per the
+  // live Host Event catalog: { agent, source, signal? }.
+  const offCreated = ctx.on('agent/created', ({ agent }) => {
+    armGuard(agent)
   })
 
-  // Return cleanup
-  return () => {
-    disposeAgentCreated()
-    for (const guard of guards.values()) {
+  // Disarm when an agent leaves the registry. Payload: { agent }.
+  const offDisposed = ctx.on('agent/disposed', ({ agent }) => {
+    const sessionId = agent.session.id
+    const guard = guards.get(sessionId)
+    if (guard) {
       guard.stop()
+      guards.delete(sessionId)
+      logger.info(`guard stopped for session ${sessionId}`)
     }
+  })
+
+  // Arm on agents already live (plugin hot-reload case).
+  const agents = ctx.get('agents')
+  if (agents) {
+    for (const agent of agents.list()) {
+      armGuard(agent)
+    }
+  }
+
+  return () => {
+    offCreated()
+    offDisposed()
+    for (const guard of guards.values()) guard.stop()
     guards.clear()
   }
 }
 
-export const inject = ['agents', 'sessions']
-
-export const Config = {
-  type: 'object',
-  properties: {
-    configFile: { type: 'string', default: 'guard.config.json' },
-    workingDir: { type: 'string' },
-  },
-}
+export const inject = ['agents']

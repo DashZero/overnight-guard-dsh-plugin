@@ -5,6 +5,25 @@ import { RecoveryLadder, ErrorBackoff } from './recovery.js'
 import { checkCaps, watchStopFile } from './caps.js'
 
 /**
+ * Parse "reset after 8m 49s" (or "reset after 45s", "reset after 1h 2m 3s")
+ * from a provider error message. Returns milliseconds, or null.
+ */
+export function parseResetAfter(message) {
+  if (typeof message !== 'string') return null
+  const match = message.match(/reset after\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?/i)
+  if (!match) return null
+  const hours = Number(match[1] || 0)
+  const minutes = Number(match[2] || 0)
+  const seconds = Number(match[3] || 0)
+  const ms = (hours * 3600 + minutes * 60 + seconds) * 1000
+  return ms > 0 ? ms : null
+}
+
+function sleep(ms, setTimeoutFn = setTimeout) {
+  return new Promise((resolve) => setTimeoutFn(resolve, ms))
+}
+
+/**
  * The overnight guard state machine.
  * Observes a session, detects stalls, recovers, enforces caps.
  */
@@ -45,6 +64,8 @@ export class OvernightGuard {
     this.haltReason = null
     this.pendingNudge = null
     this.loopCorrected = false
+    this.turnHadError = false
+    this.consecutiveTurnErrors = 0
 
     this.disposers = []
   }
@@ -124,6 +145,10 @@ export class OvernightGuard {
       case 'turn/start':
         this.onTurnStart(event.data)
         break
+      case 'step/start':
+        this.currentStep = event.data.step
+        this.logger.currentStep = event.data.step
+        break
       case 'turn/end':
         this.onTurnEnd(event.data)
         break
@@ -143,30 +168,75 @@ export class OvernightGuard {
 
   onAssistantStream(payload) {
     if (this.halted) return
+    if (payload.agent?.id !== this.agent.id) return
     this.lastEventTime = Date.now()
     this.resetStallTimer()
   }
 
   onTurnStart(data) {
     this.currentTurn = data.turn
-    this.currentStep = data.step
     this.state = 'running'
     this.logger.state = 'running'
-    this.logger.currentStep = data.step
-    this.logger.log('turn_start', { turn: data.turn, step: data.step })
+    this.logger.log('turn_start', { turn: data.turn })
     this.recovery.reset()
     this.loopDetector.reset()
     this.loopCorrected = false
+    this.turnHadError = false
   }
 
   onTurnEnd(data) {
     this.state = 'armed'
     this.logger.state = 'armed'
-    this.logger.log('turn_end', { turn: data.turn, step: data.step, reason: data.reason?.kind })
+    this.logger.log('turn_end', { turn: data.turn, reason: data.reason?.kind })
 
-    // Check for empty reply or tool-call-as-text
+    // Turn failed with an error (e.g. "upstream service could not complete
+    // this stream" after request-error retries were exhausted). Nudge the
+    // session to continue instead of leaving it dead.
+    if (data.reason?.kind === 'error') {
+      const failure = data.reason.error || {}
+      this.logger.counters.errors++
+      this.consecutiveTurnErrors++
+      this.logger.log('turn_error', {
+        turn: data.turn,
+        message: failure.message,
+        code: failure.code,
+        status: failure.status,
+        consecutive: this.consecutiveTurnErrors,
+      })
+      this.turnHadError = true
+
+      // Give up after maxErrorRetries consecutive failed turns.
+      if (this.consecutiveTurnErrors > this.config.maxErrorRetries) {
+        this.halt('too_many_consecutive_turn_errors')
+        return
+      }
+
+      // If the provider told us when quota resets ("reset after 8m 49s"),
+      // wait until then before nudging, so we do not hammer a dead pool.
+      const resetMs = parseResetAfter(failure.message)
+      if (resetMs !== null) {
+        this.logger.log('quota_reset_wait', { resetMs, turn: data.turn })
+        this._setTimeout(() => {
+          if (!this.halted) {
+            this.logger.counters.recoveries++
+            this.logger.log('turn_error_nudge_sent', { turn: data.turn, afterReset: true })
+            this.sendMessage('The previous turn failed with a provider error. Continue with the current task. If you are blocked, write NEEDS_DECISION.')
+          }
+        }, resetMs + 1000)
+        return
+      }
+
+      // Generic error — nudge immediately.
+      const continueText = 'The previous turn failed with a provider error. Continue with the current task. If you are blocked, write NEEDS_DECISION.'
+      this.logger.counters.recoveries++
+      this.logger.log('turn_error_nudge_sent', { turn: data.turn })
+      this.sendMessage(continueText)
+      return
+    }
+
+    // A successful turn clears the consecutive-error counter.
     if (data.reason?.kind === 'completed') {
-      // The turn completed normally; check if we need to advance the step
+      this.consecutiveTurnErrors = 0
       this.checkStepCompletion()
     }
   }
@@ -212,8 +282,9 @@ export class OvernightGuard {
     this.logger.log('tool_result', { isError: data.message?.isError })
   }
 
-  onRequestError(payload, next) {
+  async onRequestError(payload, next) {
     if (this.halted) return next()
+    if (payload.agent?.id && payload.agent.id !== this.agent.id) return next()
 
     this.logger.counters.errors++
     if (!this.logger.firstError) {
@@ -223,25 +294,36 @@ export class OvernightGuard {
       provider: payload.provider,
       failure: payload.failure?.message,
       code: payload.failure?.code,
+      status: payload.failure?.status,
     })
 
-    const delay = this.errorBackoff.nextDelay()
-    if (delay === null) {
-      this.logger.log('max_error_retries_reached')
-      this.markStepBlocked('max_error_retries')
-      return next()
+    // If the provider told us when quota resets, wait until then (plus a
+    // small buffer) instead of using the short backoff ladder.
+    const resetMs = parseResetAfter(payload.failure?.message)
+    let delay
+    if (resetMs !== null) {
+      delay = resetMs + 1000
+      this.logger.log('quota_reset_wait', { resetMs, provider: payload.provider })
+      this.errorBackoff.retryCount++
+      if (this.errorBackoff.retryCount > this.errorBackoff.maxRetries) {
+        this.logger.log('max_error_retries_reached')
+        this.markStepBlocked('max_error_retries')
+        return next()
+      }
+    } else {
+      delay = this.errorBackoff.nextDelay()
+      if (delay === null) {
+        this.logger.log('max_error_retries_reached')
+        this.markStepBlocked('max_error_retries')
+        return next()
+      }
     }
 
     this.logger.log('error_retry', { delay, retry: this.errorBackoff.retryCount })
 
-    // Wait with backoff, then retry
-    this._setTimeout(() => {
-      if (!this.halted) {
-        // Return retry action
-        // Note: the actual retry is handled by the agent loop when we return { kind: 'retry' }
-      }
-    }, delay)
-
+    // Wait the backoff delay, then tell the loop to retry the request.
+    await sleep(delay, this._setTimeout)
+    if (this.halted) return next()
     return { kind: 'retry' }
   }
 
@@ -351,15 +433,15 @@ export class OvernightGuard {
 
   sendMessage(text) {
     try {
-      // Create a user message and send it as followup
+      // Build a plain user message. Source kind 'user' matches MessageSourceMap.
       const message = {
-        id: `guard-${Date.now()}`,
+        id: `guard-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         role: 'user',
         content: [{ type: 'text', text }],
-        source: { kind: 'user-rpc' },
+        source: { kind: 'user' },
       }
       this.agent.followup(message)
-      this.logger.log('message_sent')
+      this.logger.log('message_sent', { preview: text.slice(0, 120) })
     } catch (error) {
       this.logger.log('send_failed', { error: error.message })
     }
