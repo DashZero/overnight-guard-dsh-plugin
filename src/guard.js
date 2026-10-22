@@ -23,6 +23,11 @@ export class OvernightGuard {
     this.agent = options.agent
     this.ctx = options.ctx
     this.onHalt = options.onHalt || (() => {})
+    // Allow injecting fake timers for testing
+    this._setTimeout = options.setTimeout || setTimeout
+    this._clearTimeout = options.clearTimeout || clearTimeout
+    this._setInterval = options.setInterval || setInterval
+    this._clearInterval = options.clearInterval || clearInterval
 
     this.logger = new GuardLogger(this.paths.logFile, this.paths.statusFile, this.paths.nightLogFile)
     this.recovery = new RecoveryLadder(this.config.maxRecoveryWindowMinutes)
@@ -57,7 +62,7 @@ export class OvernightGuard {
     })
 
     // Update status every 30 seconds
-    this.statusTimer = setInterval(() => {
+    this.statusTimer = this._setInterval(() => {
       this.logger.updateStatus()
     }, 30000)
 
@@ -87,7 +92,7 @@ export class OvernightGuard {
 
   clearStallTimer() {
     if (this.stallTimer) {
-      clearTimeout(this.stallTimer)
+      this._clearTimeout(this.stallTimer)
       this.stallTimer = null
     }
   }
@@ -95,7 +100,7 @@ export class OvernightGuard {
   resetStallTimer() {
     this.clearStallTimer()
     this.lastEventTime = Date.now()
-    this.stallTimer = setTimeout(() => {
+    this.stallTimer = this._setTimeout(() => {
       this.onStallDetected()
     }, this.config.stallSeconds * 1000)
   }
@@ -103,7 +108,7 @@ export class OvernightGuard {
   clearTimers() {
     this.clearStallTimer()
     if (this.statusTimer) {
-      clearInterval(this.statusTimer)
+      this._clearInterval(this.statusTimer)
       this.statusTimer = null
     }
   }
@@ -230,7 +235,7 @@ export class OvernightGuard {
     this.logger.log('error_retry', { delay, retry: this.errorBackoff.retryCount })
 
     // Wait with backoff, then retry
-    setTimeout(() => {
+    this._setTimeout(() => {
       if (!this.halted) {
         // Return retry action
         // Note: the actual retry is handled by the agent loop when we return { kind: 'retry' }

@@ -45,6 +45,8 @@ export function watchStopFile(stopFilePath, onStop) {
       onStop()
     }
   }, 5000)
+  // Don't keep the process alive just for this watcher
+  interval.unref()
 
   return () => {
     clearInterval(interval)
