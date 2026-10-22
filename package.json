@@ -4,8 +4,16 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
+  "files": [
+    "src/",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

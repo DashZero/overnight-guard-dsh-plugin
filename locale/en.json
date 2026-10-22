@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Overnight Guard",
+    "description": "Watches a long-running session, recovers stalls and provider errors, and enforces request/time/cost caps so an unattended job survives the night."
+  }
+}
