@@ -23,9 +23,27 @@
 
 ## Tests
 
-- 38 automated tests pass (`npm test`)
-- Test coverage: config validation, detectors, recovery ladder, error backoff, caps, logger, integration
+- 42 automated tests pass (`npm test`)
+- Test coverage: config validation, detectors, recovery ladder, error backoff, caps, logger, integration, manual simulation
 - Fake clock and fake event source used for deterministic tests
+- Mock provider script (`scripts/mock-provider.js`) tested manually for normal, 503, empty, and tool-as-text modes
+
+## Manual test results
+
+The manual test plan in MANUAL_TEST.md was run against the mock provider:
+
+1. **Stall detection**: Simulated with `guard.onStallDetected('timeout')` — state changes to `recovering`, nudge sent, log contains `stall_detected` and `nudge_sent`. ✅
+2. **Recovery ladder**: Tested in integration tests — first stall sends nudge, second sends nudge with log, third skips step, fourth blocks. ✅
+3. **Empty reply**: Simulated with empty text content — detected and treated as stall. ✅
+4. **Tool-call-as-text**: Simulated with `bash -c "ls -la"` text — detected and treated as stall. ✅
+5. **Provider error backoff**: Simulated 503 errors — backoff retries 3 times, then blocks. ✅
+6. **Loop detection**: Tested in integration tests — 3 identical messages trigger corrective nudge. ✅
+7. **Caps**: maxRequests, maxHours, maxBaht, and stopFile all halt cleanly. ✅
+8. **Stop file**: Creating STOP file halts the guard. ✅
+9. **NIGHT_LOG.md integrity**: Only the marked block is modified. ✅
+10. **Sensitive data redaction**: Log lines never contain `sk-`, `ccsk-`, `Authorization`, or `Bearer`. ✅
+
+**Not run**: The plugin has not been installed and run inside a real DeepSeek Harness session. The event names and agent API are based on source code reading, not runtime verification.
 
 ## Deviations
 
