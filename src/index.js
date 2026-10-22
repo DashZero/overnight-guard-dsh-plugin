@@ -24,16 +24,20 @@ export function apply(ctx, config = {}) {
     if (guards.has(sessionId)) return
     if (config.sessionId && config.sessionId !== sessionId) return
 
-    const cwd = agent.session.header?.cwd ?? process.cwd()
-    const configFile = resolve(cwd, config.configFile ?? 'guard.config.json')
-    if (!existsSync(configFile)) {
-      logger.info(`no guard config at ${configFile}; session ${sessionId} is not guarded`)
+    const cwd = agent.session.header?.cwd
+    if (!cwd) {
+      logger.info(`session ${sessionId} has no cwd; not guarded`)
       return
     }
 
+    // Guard every session by default; guard.config.json in the session's cwd
+    // overrides the defaults. Create a STOP file in the cwd to halt.
     let guardConfig
+    const configFile = resolve(cwd, config.configFile ?? 'guard.config.json')
     try {
-      guardConfig = validateConfig(JSON.parse(readFileSync(configFile, 'utf8')), configFile)
+      guardConfig = existsSync(configFile)
+        ? validateConfig(JSON.parse(readFileSync(configFile, 'utf8')), configFile)
+        : validateConfig({}, 'defaults')
     } catch (error) {
       logger.error(`invalid guard config ${configFile}: ${error.message}`)
       return

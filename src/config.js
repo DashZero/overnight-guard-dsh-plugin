@@ -15,6 +15,8 @@ const DEFAULTS = {
   stepDoneMarker: 'STEP_DONE',
   logFile: 'night-guard.log.jsonl',
   statusFile: 'night-status.json',
+  // Quota resets longer than this are not worth waiting for: halt instead.
+  maxResetWaitSeconds: 600,
 }
 
 const REQUIRED_KEYS = Object.keys(REQUIRED_DEFAULTS())
@@ -52,6 +54,7 @@ export function validateConfig(raw, source = 'config') {
     ['maxHours', 0.1, 720],
     ['bahtPerRequest', 0, 1000],
     ['maxBaht', 0, 100000],
+    ['maxResetWaitSeconds', 0, 86400],
   ]
   for (const [key, min, max] of numericFields) {
     const value = config[key]

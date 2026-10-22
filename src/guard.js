@@ -19,6 +19,40 @@ export function parseResetAfter(message) {
   return ms > 0 ? ms : null
 }
 
+/**
+ * Classify a provider failure:
+ * - 'fatal': unfixable by waiting or retrying (model not in the pool, model
+ *   not supported, pool broken, invalid credentials, account quota exhausted).
+ *   The guard must halt immediately.
+ * - 'quota': rate limit / quota with a "reset after …" hint — wait for the
+ *   reset, unless it is longer than maxResetWaitSeconds.
+ * - 'transient': anything else (connection error, stream failure, 5xx with no
+ *   reset hint) — retry with the backoff ladder.
+ */
+export function classifyFailure(failure) {
+  const message = String(failure?.message || '')
+  const code = String(failure?.code || '')
+  const status = failure?.status
+
+  // Auth and account problems — retrying never helps.
+  if (status === 401 || status === 403) return 'fatal'
+  if (/invalid[_ ]credential|invalid api key|unauthorized|forbidden/i.test(message + ' ' + code)) return 'fatal'
+  if (/ACCOUNT_QUOTA_EXCEEDED|QUOTA_EXCEEDED/.test(code)) return 'fatal'
+
+  // Model not available in the pool / pool broken.
+  if (status === 404) return 'fatal'
+  if (/model.*not (supported|found|available)/i.test(message)) return 'fatal'
+  if (/not supported when using/i.test(message)) return 'fatal'
+  if (/no such model|unknown model|does not exist/i.test(message)) return 'fatal'
+
+  // Quota/rate limit with a reset window — waiting helps, briefly.
+  if (parseResetAfter(message) !== null) return 'quota'
+  if (status === 429) return 'quota'
+  if (/rate.?limit|too many requests/i.test(message + ' ' + code)) return 'quota'
+
+  return 'transient'
+}
+
 function sleep(ms, setTimeoutFn = setTimeout) {
   return new Promise((resolve) => setTimeoutFn(resolve, ms))
 }
@@ -66,6 +100,7 @@ export class OvernightGuard {
     this.loopCorrected = false
     this.turnHadError = false
     this.consecutiveTurnErrors = 0
+    this.waitingForReset = false
 
     this.disposers = []
   }
@@ -205,6 +240,13 @@ export class OvernightGuard {
       })
       this.turnHadError = true
 
+      // Fatal errors (model not in pool, auth, account quota) — stop now.
+      const failureClass = classifyFailure(failure)
+      if (failureClass === 'fatal') {
+        this.halt(`fatal_provider_error: ${failure.message}`)
+        return
+      }
+
       // Give up after maxErrorRetries consecutive failed turns.
       if (this.consecutiveTurnErrors > this.config.maxErrorRetries) {
         this.halt('too_many_consecutive_turn_errors')
@@ -212,11 +254,22 @@ export class OvernightGuard {
       }
 
       // If the provider told us when quota resets ("reset after 8m 49s"),
-      // wait until then before nudging, so we do not hammer a dead pool.
+      // wait only when the reset is short; a long wait means stop.
       const resetMs = parseResetAfter(failure.message)
       if (resetMs !== null) {
+        if (resetMs > this.config.maxResetWaitSeconds * 1000) {
+          this.halt(`quota_reset_too_long: ${Math.round(resetMs / 60000)}m`)
+          return
+        }
+        if (!this.fitsInTimeBudget(resetMs)) {
+          this.halt('quota_reset_beyond_max_hours')
+          return
+        }
         this.logger.log('quota_reset_wait', { resetMs, turn: data.turn })
+        this.waitingForReset = true
+        this.clearStallTimer()
         this._setTimeout(() => {
+          this.waitingForReset = false
           if (!this.halted) {
             this.logger.counters.recoveries++
             this.logger.log('turn_error_nudge_sent', { turn: data.turn, afterReset: true })
@@ -297,11 +350,27 @@ export class OvernightGuard {
       status: payload.failure?.status,
     })
 
-    // If the provider told us when quota resets, wait until then (plus a
-    // small buffer) instead of using the short backoff ladder.
+    // Fatal errors (model not in pool, auth, account quota) — stop now,
+    // let the loop end the turn instead of retrying.
+    if (classifyFailure(payload.failure) === 'fatal') {
+      this.halt(`fatal_provider_error: ${payload.failure?.message}`)
+      return next()
+    }
+
+    // If the provider told us when quota resets, wait only when the reset
+    // is short; a long wait means stop.
     const resetMs = parseResetAfter(payload.failure?.message)
     let delay
     if (resetMs !== null) {
+      if (resetMs > this.config.maxResetWaitSeconds * 1000) {
+        this.halt(`quota_reset_too_long: ${Math.round(resetMs / 60000)}m`)
+        return next()
+      }
+      // A reset beyond the remaining time budget is hopeless — halt now.
+      if (!this.fitsInTimeBudget(resetMs)) {
+        this.halt('quota_reset_beyond_max_hours')
+        return next()
+      }
       delay = resetMs + 1000
       this.logger.log('quota_reset_wait', { resetMs, provider: payload.provider })
       this.errorBackoff.retryCount++
@@ -310,6 +379,9 @@ export class OvernightGuard {
         this.markStepBlocked('max_error_retries')
         return next()
       }
+      // Pause stall detection while we deliberately wait for the quota window.
+      this.waitingForReset = true
+      this.clearStallTimer()
     } else {
       delay = this.errorBackoff.nextDelay()
       if (delay === null) {
@@ -323,12 +395,27 @@ export class OvernightGuard {
 
     // Wait the backoff delay, then tell the loop to retry the request.
     await sleep(delay, this._setTimeout)
+    this.waitingForReset = false
     if (this.halted) return next()
+    this.resetStallTimer()
     return { kind: 'retry' }
+  }
+
+  /**
+   * True when waiting `ms` still leaves time inside the maxHours budget.
+   */
+  fitsInTimeBudget(ms) {
+    if (!this.config.maxHours) return true
+    const startedMs = Date.parse(this.logger.startedAt)
+    if (!Number.isFinite(startedMs)) return true
+    const elapsedMs = Date.now() - startedMs
+    return elapsedMs + ms < this.config.maxHours * 3600_000
   }
 
   onStallDetected(reason = 'timeout') {
     if (this.halted) return
+    // A deliberate quota-reset wait is not a stall.
+    if (this.waitingForReset) return
     if (this.state === 'stalled' || this.state === 'recovering') return
 
     this.state = 'stalled'

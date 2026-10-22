@@ -4,7 +4,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from 'node
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import { OvernightGuard, parseResetAfter } from '../src/guard.js'
+import { OvernightGuard, parseResetAfter, classifyFailure } from '../src/guard.js'
 import { validateConfig, resolvePaths } from '../src/config.js'
 
 // Fake clock for deterministic tests
@@ -364,6 +364,75 @@ describe('OvernightGuard integration', () => {
     guard.onTurnEnd({ turn: 2, reason: { kind: 'completed' } })
     assert.strictEqual(guard.consecutiveTurnErrors, 0)
     assert.ok(!guard.halted)
+  })
+
+  test('fatal provider error halts immediately', () => {
+    guard.start()
+    guard.onTurnStart({ turn: 1 })
+
+    guard.onTurnEnd({
+      turn: 1,
+      reason: {
+        kind: 'error',
+        error: { message: "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.", code: 'UNKNOWN', status: 400 },
+      },
+    })
+
+    assert.ok(guard.halted)
+    assert.ok(guard.haltReason.startsWith('fatal_provider_error'))
+    assert.strictEqual(agent.messages.length, 0)
+  })
+
+  test('quota reset longer than maxResetWaitSeconds halts', () => {
+    guard.start()
+    guard.onTurnStart({ turn: 1 })
+
+    // 1-hour reset with the default 10-minute cap
+    guard.onTurnEnd({
+      turn: 1,
+      reason: {
+        kind: 'error',
+        error: { message: '503: quota exhausted (reset after 1h 0m 0s)', code: 'UNKNOWN' },
+      },
+    })
+
+    assert.ok(guard.halted)
+    assert.ok(guard.haltReason.startsWith('quota_reset_too_long'))
+    assert.strictEqual(agent.messages.length, 0)
+  })
+
+  test('auth failure is fatal', () => {
+    guard.start()
+    guard.onTurnStart({ turn: 1 })
+    guard.onTurnEnd({
+      turn: 1,
+      reason: { kind: 'error', error: { message: 'Invalid API key', code: 'INVALID_CREDENTIAL', status: 401 } },
+    })
+    assert.ok(guard.halted)
+    assert.ok(guard.haltReason.startsWith('fatal_provider_error'))
+  })
+})
+
+describe('classifyFailure', () => {
+  test('model not supported is fatal', () => {
+    assert.strictEqual(classifyFailure({ message: "The 'gpt-6.1-sol' model is not supported when using Codex" }), 'fatal')
+    assert.strictEqual(classifyFailure({ message: 'model not found', status: 404 }), 'fatal')
+  })
+
+  test('auth errors are fatal', () => {
+    assert.strictEqual(classifyFailure({ message: 'unauthorized', status: 401 }), 'fatal')
+    assert.strictEqual(classifyFailure({ code: 'ACCOUNT_QUOTA_EXCEEDED' }), 'fatal')
+  })
+
+  test('reset hint and 429 are quota', () => {
+    assert.strictEqual(classifyFailure({ message: '503: {} (reset after 8m 49s)' }), 'quota')
+    assert.strictEqual(classifyFailure({ message: 'slow down', status: 429 }), 'quota')
+  })
+
+  test('stream and connection errors are transient', () => {
+    assert.strictEqual(classifyFailure({ message: 'The upstream service could not complete this stream.' }), 'transient')
+    assert.strictEqual(classifyFailure({ message: 'Connection error.' }), 'transient')
+    assert.strictEqual(classifyFailure({ message: '503 Service Unavailable' }), 'transient')
   })
 })
 
