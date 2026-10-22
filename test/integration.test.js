@@ -411,6 +411,99 @@ describe('OvernightGuard integration', () => {
     assert.ok(guard.halted)
     assert.ok(guard.haltReason.startsWith('fatal_provider_error'))
   })
+
+  test('completed turn clears stall timer and never nudges completed session', () => {
+    guard.start()
+    guard.onTurnStart({ turn: 1 })
+    assert.ok(guard.stallTimer !== null)
+
+    // Turn completes normally
+    guard.onTurnEnd({ turn: 1, reason: { kind: 'completed' } })
+    assert.strictEqual(guard.stallTimer, null)
+    assert.strictEqual(guard.state, 'armed')
+
+    // Stall trigger when idle/armed does nothing
+    guard.onStallDetected('timeout')
+    assert.strictEqual(agent.messages.length, 0)
+    assert.strictEqual(agent.cancelled, false)
+  })
+
+  test('sendMessage retries if DSH reports reentrant session append', () => {
+    let attempts = 0
+    const reentrantAgent = {
+      session: { id: 'test-session' },
+      messages: [],
+      cancelled: false,
+      followup(msg) {
+        attempts++
+        if (attempts === 1) {
+          throw new Error('session append cannot reenter while another append is being published')
+        }
+        this.messages.push(msg)
+      },
+      cancel() { this.cancelled = true },
+    }
+
+    const scheduled = []
+    const fakeSetTimeout = (cb, ms) => { scheduled.push(cb); return { cb } }
+    const g = new OvernightGuard({
+      config, paths, agent: reentrantAgent,
+      ctx: { on: (e, l) => eventSource.on(e, l), logger: () => ({ info: () => {}, error: () => {} }) },
+      onHalt: () => {},
+      setTimeout: fakeSetTimeout,
+    })
+
+    g.sendMessage('test message')
+    assert.strictEqual(attempts, 1)
+    assert.strictEqual(reentrantAgent.messages.length, 0)
+    assert.strictEqual(scheduled.length, 1)
+
+    // Execute the retry
+    scheduled[0]()
+    assert.strictEqual(attempts, 2)
+    assert.strictEqual(reentrantAgent.messages.length, 1)
+    assert.strictEqual(reentrantAgent.messages[0].content[0].text, 'test message')
+
+    g.stop()
+  })
+
+  test('max error retries halts without sending skip message', async () => {
+    const customAgent = new FakeAgent()
+    const testConfig = validateConfig({ ...config, stallSeconds: 86400 })
+    const g = new OvernightGuard({
+      config: testConfig, paths, agent: customAgent,
+      ctx: { on: (e, l) => eventSource.on(e, l), logger: () => ({ info: () => {}, error: () => {} }) },
+      onHalt: () => {},
+      setTimeout: (cb, ms) => {
+        // Execute sleep backoff immediately, ignore stall timer
+        if (ms !== 86400 * 1000) cb()
+        return { unref: () => {} }
+      },
+    })
+    g.start()
+    g.onTurnStart({ turn: 1 })
+
+    const payload = {
+      turn: 1,
+      step: 1,
+      provider: 'mock',
+      failure: { message: '503 Service Unavailable', code: 'service_unavailable' },
+    }
+
+    for (let i = 0; i < testConfig.maxErrorRetries; i++) {
+      await g.onRequestError(payload, () => {})
+    }
+
+    // Next attempt exhausts retries
+    let nextCalled = false
+    await g.onRequestError(payload, () => { nextCalled = true })
+    assert.ok(nextCalled)
+    assert.ok(g.halted)
+    assert.strictEqual(g.state, 'blocked')
+    // Crucial: NO "Skip this step, take the next one in the brief" message sent!
+    assert.strictEqual(customAgent.messages.length, 0)
+    g.stop()
+  })
 })
 
 describe('classifyFailure', () => {

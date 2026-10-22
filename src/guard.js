@@ -81,6 +81,7 @@ export class OvernightGuard {
     this._clearTimeout = options.clearTimeout || clearTimeout
     this._setInterval = options.setInterval || setInterval
     this._clearInterval = options.clearInterval || clearInterval
+    this._setImmediate = options.setImmediate || setImmediate
 
     this.logger = new GuardLogger(this.paths.logFile, this.paths.statusFile, this.paths.nightLogFile)
     this.recovery = new RecoveryLadder(this.config.maxRecoveryWindowMinutes)
@@ -155,6 +156,7 @@ export class OvernightGuard {
 
   resetStallTimer() {
     this.clearStallTimer()
+    if (this.state !== 'running' || this.halted) return
     this.lastEventTime = Date.now()
     this.stallTimer = this._setTimeout(() => {
       this.onStallDetected()
@@ -174,7 +176,6 @@ export class OvernightGuard {
     if (session.id !== this.agent.session.id) return
 
     this.lastEventTime = Date.now()
-    this.resetStallTimer()
 
     switch (event.type) {
       case 'turn/start':
@@ -183,18 +184,22 @@ export class OvernightGuard {
       case 'step/start':
         this.currentStep = event.data.step
         this.logger.currentStep = event.data.step
+        if (this.state === 'running') this.resetStallTimer()
         break
       case 'turn/end':
         this.onTurnEnd(event.data)
         break
       case 'assistant/message':
         this.onAssistantMessage(event.data)
+        if (this.state === 'running') this.resetStallTimer()
         break
       case 'tool/call':
         this.onToolCall(event.data)
+        if (this.state === 'running') this.resetStallTimer()
         break
       case 'tool/result':
         this.onToolResult(event.data)
+        if (this.state === 'running') this.resetStallTimer()
         break
     }
 
@@ -205,7 +210,7 @@ export class OvernightGuard {
     if (this.halted) return
     if (payload.agent?.id !== this.agent.id) return
     this.lastEventTime = Date.now()
-    this.resetStallTimer()
+    if (this.state === 'running') this.resetStallTimer()
   }
 
   onTurnStart(data) {
@@ -217,12 +222,26 @@ export class OvernightGuard {
     this.loopDetector.reset()
     this.loopCorrected = false
     this.turnHadError = false
+    this.resetStallTimer()
   }
 
   onTurnEnd(data) {
     this.state = 'armed'
     this.logger.state = 'armed'
+    this.clearStallTimer()
     this.logger.log('turn_end', { turn: data.turn, reason: data.reason?.kind })
+
+    // A completed or aborted turn must NEVER be nudged or restarted.
+    if (data.reason?.kind === 'completed') {
+      this.consecutiveTurnErrors = 0
+      this.turnHadError = false
+      this.checkStepCompletion()
+      return
+    }
+
+    if (data.reason?.kind === 'aborted') {
+      return
+    }
 
     // Turn failed with an error (e.g. "upstream service could not complete
     // this stream" after request-error retries were exhausted). Nudge the
@@ -285,12 +304,6 @@ export class OvernightGuard {
       this.logger.log('turn_error_nudge_sent', { turn: data.turn })
       this.sendMessage(continueText)
       return
-    }
-
-    // A successful turn clears the consecutive-error counter.
-    if (data.reason?.kind === 'completed') {
-      this.consecutiveTurnErrors = 0
-      this.checkStepCompletion()
     }
   }
 
@@ -393,7 +406,8 @@ export class OvernightGuard {
 
     this.logger.log('error_retry', { delay, retry: this.errorBackoff.retryCount })
 
-    // Wait the backoff delay, then tell the loop to retry the request.
+    // Pause stall detection while waiting out backoff delay.
+    this.clearStallTimer()
     await sleep(delay, this._setTimeout)
     this.waitingForReset = false
     if (this.halted) return next()
@@ -414,8 +428,9 @@ export class OvernightGuard {
 
   onStallDetected(reason = 'timeout') {
     if (this.halted) return
-    // A deliberate quota-reset wait is not a stall.
-    if (this.waitingForReset) return
+    // A deliberate quota-reset wait is not a stall. Finished or idle sessions
+    // must not be woken by the stall timer.
+    if (this.waitingForReset || this.state !== 'running') return
     if (this.state === 'stalled' || this.state === 'recovering') return
 
     this.state = 'stalled'
@@ -494,7 +509,6 @@ export class OvernightGuard {
   skipStep() {
     this.logger.log('step_skipped', { step: this.currentStep })
     this.logger.appendNightLog(this.currentStep, 'skipped', 'Max recovery attempts reached')
-    this.sendMessage('Skip this step, take the next one in the brief')
     this.recovery.reset()
   }
 
@@ -507,9 +521,13 @@ export class OvernightGuard {
     this.logger.appendNightLog(this.currentStep, 'blocked', reason)
     this.logger.updateStatus()
 
-    // Move to next step
-    this.sendMessage('Skip this step, take the next one in the brief')
-    this.recovery.reset()
+    // Stop and halt cleanly without sending confusing skip messages
+    this.clearTimers()
+    this.halted = true
+    this.haltReason = reason
+    this.logger.log('guard_halted', { reason })
+    this.logger.writeSummary(reason)
+    this.onHalt(reason)
   }
 
   checkStepCompletion() {
@@ -519,6 +537,7 @@ export class OvernightGuard {
   }
 
   sendMessage(text) {
+    if (this.halted) return
     try {
       // Build a plain user message. Source kind 'user' matches MessageSourceMap.
       const message = {
@@ -531,6 +550,24 @@ export class OvernightGuard {
       this.logger.log('message_sent', { preview: text.slice(0, 120) })
     } catch (error) {
       this.logger.log('send_failed', { error: error.message })
+      // DSH throws if session append is currently in-flight; retry once after it settles.
+      if (error.message && error.message.includes('reenter')) {
+        this._setTimeout(() => {
+          if (this.halted) return
+          try {
+            const message = {
+              id: `guard-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              role: 'user',
+              content: [{ type: 'text', text }],
+              source: { kind: 'user' },
+            }
+            this.agent.followup(message)
+            this.logger.log('message_sent', { preview: text.slice(0, 120), retried: true })
+          } catch (retryErr) {
+            this.logger.log('send_retry_failed', { error: retryErr.message })
+          }
+        }, 200)
+      }
     }
   }
 
